@@ -1,0 +1,55 @@
+import logging
+from functools import wraps
+from typing import Callable
+from pyrogram import Client
+from pyrogram.types import Message, CallbackQuery
+from bot.database import db
+from bot.config import Config
+
+logger = logging.getLogger("AuthCheck")
+
+ROLE_HIERARCHY = {
+    "USER": 1,
+    "ADMIN": 2,
+    "OWNER": 3
+}
+
+async def get_user_role(user_id: int) -> str:
+    """Retrieves the highest role for a given user."""
+    if user_id == Config.OWNER_ID:
+        return "OWNER"
+        
+    admin_record = await db.admins.find_one({"user_id": user_id})
+    if admin_record:
+        return admin_record.get("role", "USER")
+        
+    return "USER"
+
+def require_role(minimum_role: str):
+    """
+    Decorator to enforce role-based access control on handlers.
+    Checks authorization inside the callback/operation before execution.
+    """
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(client: Client, update: Message | CallbackQuery, *args, **kwargs):
+            user_id = update.from_user.id
+            current_role = await get_user_role(user_id)
+            
+            current_level = ROLE_HIERARCHY.get(current_role, 0)
+            required_level = ROLE_HIERARCHY.get(minimum_role, 99)
+            
+            if current_level >= required_level:
+                return await func(client, update, *args, **kwargs)
+            
+            # Unauthorized access attempt
+            logger.warning(f"Unauthorized access attempt by {user_id} (Role: {current_role}) for {func.__name__}")
+            
+            error_msg = "⛔️ You do not have permission to perform this action."
+            if isinstance(update, CallbackQuery):
+                await update.answer(error_msg, show_alert=True)
+            else:
+                await update.reply_text(error_msg)
+                
+        return wrapper
+    return decorator

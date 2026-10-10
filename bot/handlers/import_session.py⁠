@@ -1,0 +1,154 @@
+import os
+import shutil
+import zipfile
+import logging
+from pathlib import Path
+from pyrogram import Client
+from pyrogram.types import Message
+from bot.state_machine import state_manager, AuthState
+from bot.database import db
+
+logger = logging.getLogger("ImportHandler")
+
+TEMP_DIR = Path("/app/temp")
+
+async def handle_import_command(client: Client, message: Message):
+    """Initiates the session import flow."""
+    user_id = message.from_user.id
+    state_manager.set_state(user_id, AuthState.IMPORTING_SESSION)
+    await message.reply_text(
+        "Please send the session files you want to import.\n\n"
+        "Supported formats: `.session` (Pyrogram SQLite) or `.zip` containing `.session` files.\n"
+        "Send /cancel to stop."
+    )
+
+async def process_document_import(client: Client, message: Message):
+    """Processes uploaded files for session extraction."""
+    user_id = message.from_user.id
+    if state_manager.get_state(user_id) != AuthState.IMPORTING_SESSION:
+        return
+
+    if not message.document:
+        await message.reply_text("Please send a valid `.session` or `.zip` file.")
+        return
+
+    file_ext = os.path.splitext(message.document.file_name)[1].lower()
+    if file_ext not in [".session", ".zip"]:
+        await message.reply_text("Unsupported file type. Please send `.session` or `.zip` files.")
+        return
+
+    status_msg = await message.reply_text("Downloading and validating file...")
+    
+    # Create secure temporary directory for this specific user
+    user_temp_dir = TEMP_DIR / str(user_id)
+    user_temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    file_path = user_temp_dir / message.document.file_name
+    
+    try:
+        await message.download(file_name=str(file_path))
+        
+        if file_ext == ".zip":
+            await _process_zip_import(file_path, user_temp_dir, status_msg, user_id)
+        else:
+            await _process_sqlite_import(file_path, status_msg, user_id)
+            
+    except Exception as e:
+        logger.error(f"Error processing import: {e}")
+        await status_msg.edit_text("An error occurred during import. The operation was aborted.")
+    finally:
+        # Secure cleanup: Ensure temporary files are deleted
+        if user_temp_dir.exists():
+            shutil.rmtree(user_temp_dir, ignore_errors=True)
+
+async def _process_zip_import(zip_path: Path, extract_dir: Path, status_msg: Message, owner_id: int):
+    """Extracts ZIP files safely and processes contained sessions."""
+    success_count = 0
+    fail_count = 0
+
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            for member in zip_ref.namelist():
+                # Prevent path traversal attacks (Zip Slip)
+                member_path = os.path.abspath(os.path.join(extract_dir, member))
+                if not member_path.startswith(os.path.abspath(extract_dir)):
+                    logger.warning(f"Skipping malicious path in ZIP: {member}")
+                    continue
+                    
+                if member.endswith(".session"):
+                    extracted_path = zip_ref.extract(member, path=extract_dir)
+                    if await _validate_and_save_session(Path(extracted_path), owner_id):
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                        
+        await status_msg.edit_text(f"Import complete.\n✅ Success: {success_count}\n❌ Failed/Invalid: {fail_count}")
+    except zipfile.BadZipFile:
+        await status_msg.edit_text("The uploaded ZIP file is corrupt or invalid.")
+
+async def _process_sqlite_import(file_path: Path, status_msg: Message, owner_id: int):
+    """Processes a single SQLite Pyrogram session file."""
+    if await _validate_and_save_session(file_path, owner_id):
+        await status_msg.edit_text("✅ Session imported and authorized successfully.")
+    else:
+        await status_msg.edit_text("❌ Failed to import session. The file may be invalid, expired, or unsupported.")
+
+async def _validate_and_save_session(session_file_path: Path, owner_id: int) -> bool:
+    """
+    Uses Pyrogram to load the SQLite file natively, validates the session with Telegram,
+    exports the session string, and saves it to MongoDB.
+    """
+    session_name = session_file_path.stem
+    workdir = session_file_path.parent
+
+    # Initialize Pyrogram client targeting the SQLite file in the workdir
+    temp_client = Client(
+        name=session_name,
+        workdir=str(workdir),
+        api_id=Config.API_ID,       # Requires bot's API credentials as fallback
+        api_hash=Config.API_HASH
+    )
+
+    try:
+        await temp_client.start()
+        
+        # Verify authorization
+        me = await temp_client.get_me()
+        if not me:
+            raise ValueError("Unable to fetch user data")
+
+        # Export raw string
+        session_string = await temp_client.export_session_string()
+        
+        # Detect duplicates
+        session_id = str(me.id)
+        exists = await db.sessions.find_one({"_id": session_id})
+        if exists and exists.get("owner_id") != owner_id:
+            logger.warning(f"Attempt to import session {session_id} already owned by {exists.get('owner_id')}")
+            return False
+
+        # Save to DB
+        await db.sessions.update_one(
+            {"_id": session_id},
+            {"$set": {
+                "user_id": me.id,
+                "owner_id": owner_id,
+                "first_name": me.first_name,
+                "username": me.username,
+                "phone": me.phone_number,
+                "session_string": session_string,
+                "is_valid": True,
+                "status": "active",
+                "imported_at": message.date if 'message' in locals() else None # Handled outside generally
+            }},
+            upsert=True
+        )
+        logger.info(f"User {owner_id} imported session for {me.id} successfully.")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to validate imported session {session_file_path.name}: {e}")
+        return False
+    finally:
+        if temp_client.is_connected:
+            await temp_client.stop()

@@ -1,0 +1,128 @@
+import logging
+import asyncio
+from typing import List, Dict, Any
+from pyrogram import Client
+from pyrogram.errors import FloodWait, MessageIdInvalid, ChatAdminRequired, ReactionEmpty
+from bot.client_manager import client_manager
+from bot.database import db
+
+logger = logging.getLogger("ReactionManager")
+
+class ReactionManager:
+    """
+    Handles authorized, rate-limited engagement on posts.
+    Utilizes an asynchronous task queue with bounded exponential backoff to respect Telegram rate limits.
+    """
+    def __init__(self):
+        self._queue = asyncio.Queue()
+        self._workers: List[asyncio.Task] = []
+        self._running = False
+        self.MAX_RETRIES = 3
+        self.CONCURRENCY_LIMIT = 2
+
+    async def start(self):
+        """Starts the reaction processing workers."""
+        if self._running:
+            return
+        self._running = True
+        for _ in range(self.CONCURRENCY_LIMIT):
+            task = asyncio.create_task(self._worker_loop())
+            self._workers.append(task)
+        logger.info(f"ReactionManager started with {self.CONCURRENCY_LIMIT} workers.")
+
+    async def stop(self):
+        """Gracefully stops the workers and processes remaining queue items if possible."""
+        self._running = False
+        for _ in range(self.CONCURRENCY_LIMIT):
+            await self._queue.put(None) # Shutdown signal
+        
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+            self._workers.clear()
+        logger.info("ReactionManager stopped.")
+
+    async def queue_reaction(self, channel_id: int, message_id: int, session_id: str, emoji: str):
+        """Adds a reaction task to the processing queue."""
+        # Check for duplicate processing before queuing
+        exists = await db.processed_posts.find_one({
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "action_type": "reaction",
+            "session_id": session_id
+        })
+        
+        if exists:
+            logger.debug(f"Reaction already processed for {channel_id}/{message_id} by {session_id}")
+            return
+
+        await self._queue.put({
+            "channel_id": channel_id,
+            "message_id": message_id,
+            "session_id": session_id,
+            "emoji": emoji,
+            "retries": 0
+        })
+
+    async def _worker_loop(self):
+        """Processes reaction tasks, respecting FloodWait and managing retries."""
+        while self._running:
+            task: Dict[str, Any] = await self._queue.get()
+            if task is None:
+                self._queue.task_done()
+                break
+
+            channel_id = task["channel_id"]
+            message_id = task["message_id"]
+            session_id = task["session_id"]
+            emoji = task["emoji"]
+            retries = task["retries"]
+
+            try:
+                session_data = await db.sessions.find_one({"_id": session_id})
+                if not session_data or not session_data.get("is_valid"):
+                    logger.warning(f"Skipping reaction: Session {session_id} is invalid.")
+                    continue
+
+                client = await client_manager.get_or_start_client(session_id, session_data["session_string"])
+                if not client:
+                    continue
+
+                # Pyrogram 2.x method for sending reactions
+                await client.send_reaction(chat_id=channel_id, message_id=message_id, emoji=emoji)
+                
+                # Record success atomically
+                await db.processed_posts.update_one(
+                    {
+                        "channel_id": channel_id, 
+                        "message_id": message_id, 
+                        "action_type": "reaction",
+                        "session_id": session_id
+                    },
+                    {"$set": {"status": "success", "emoji": emoji}},
+                    upsert=True
+                )
+                logger.info(f"Successfully applied reaction '{emoji}' to {channel_id}/{message_id}")
+
+            except FloodWait as e:
+                logger.warning(f"FloodWait applying reaction. Sleeping for {e.value} seconds.")
+                await asyncio.sleep(e.value)
+                if retries < self.MAX_RETRIES:
+                    task["retries"] += 1
+                    # Re-queue after sleeping
+                    await self._queue.put(task)
+                else:
+                    logger.error(f"Max retries reached for reaction on {channel_id}/{message_id}")
+                    
+            except (MessageIdInvalid, ChatAdminRequired, ReactionEmpty) as e:
+                logger.error(f"Cannot apply reaction to {channel_id}/{message_id}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error applying reaction: {e}")
+                if retries < self.MAX_RETRIES:
+                    # Exponential backoff for unknown transient errors: 2, 4, 8 seconds
+                    await asyncio.sleep(2 ** (retries + 1))
+                    task["retries"] += 1
+                    await self._queue.put(task)
+            finally:
+                self._queue.task_done()
+
+reaction_manager = ReactionManager()

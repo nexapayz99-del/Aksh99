@@ -1,0 +1,31 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${PORT:-7860}:${PORT:-7860}"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    volumes:
+      - bot_sessions:/app/sessions
+      - bot_temp:/app/temp
+
+  mongo:
+    image: mongo:7.0
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_DATABASE: ${DB_NAME:-telegram_manager}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mongo_data:
+  bot_sessions:
+  bot_temp:

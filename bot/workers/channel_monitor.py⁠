@@ -1,0 +1,136 @@
+import logging
+import asyncio
+from typing import Optional
+from pyrogram.errors import FloodWait, ChannelPrivate, PeerIdInvalid
+from bot.database import db
+from bot.config import Config
+from bot.client_manager import client_manager
+
+logger = logging.getLogger("ChannelMonitor")
+
+class ChannelMonitor:
+    """
+    Background worker that polls configured channels for new posts.
+    Provides a fallback when raw Telegram updates are unreliable.
+    """
+    def __init__(self):
+        self._task: Optional[asyncio.Task] = None
+        self._running = False
+        self._cancel_event = asyncio.Event()
+
+    async def start(self):
+        """Starts the channel monitoring worker."""
+        if self._running or (self._task and not self._task.done()):
+            logger.warning("Channel monitor is already running.")
+            return
+
+        self._running = True
+        self._cancel_event.clear()
+        self._task = asyncio.create_task(self._monitoring_loop())
+        logger.info("Channel monitor started.")
+
+    async def stop(self):
+        """Stops the monitoring worker gracefully."""
+        if not self._running:
+            return
+
+        logger.info("Stopping channel monitor...")
+        self._running = False
+        self._cancel_event.set()
+        
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Channel monitor stopped.")
+
+    async def _monitoring_loop(self):
+        """The main polling loop."""
+        while self._running:
+            try:
+                await self._process_channels()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Unexpected error in channel monitor loop: {e}", exc_info=True)
+            
+            # Sleep until the next polling interval, but wake up immediately if cancelled
+            try:
+                await asyncio.wait_for(
+                    self._cancel_event.wait(), 
+                    timeout=Config.CHANNEL_POST_POLL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                # Timeout is expected, it means we should poll again
+                pass
+
+    async def _process_channels(self):
+        """Iterates through monitored channels and checks for new posts."""
+        cursor = db.monitored_channels.find({"is_active": True})
+        async for channel_doc in cursor:
+            if not self._running:
+                break
+                
+            channel_id = channel_doc.get("channel_id")
+            session_id = channel_doc.get("watcher_session_id")
+
+            if not channel_id or not session_id:
+                continue
+
+            await self._check_new_posts(channel_id, session_id)
+
+    async def _check_new_posts(self, channel_id: int, session_id: str):
+        """Checks a specific channel for new posts using the designated session."""
+        try:
+            # Retrieve the session string
+            session_data = await db.sessions.find_one({"_id": session_id})
+            if not session_data or not session_data.get("is_valid"):
+                logger.warning(f"Watcher session {session_id} is invalid. Skipping channel {channel_id}.")
+                return
+
+            client = await client_manager.get_or_start_client(session_id, session_data["session_string"])
+            if not client:
+                return
+
+            # Fetch the latest message
+            async for message in client.get_chat_history(channel_id, limit=1):
+                msg_id = message.id
+                
+                # Check if we've already processed this message
+                exists = await db.processed_posts.find_one({
+                    "channel_id": channel_id,
+                    "message_id": msg_id,
+                    "action_type": "new_post_detection"
+                })
+
+                if not exists:
+                    # Record it atomically
+                    result = await db.processed_posts.update_one(
+                        {"channel_id": channel_id, "message_id": msg_id, "action_type": "new_post_detection"},
+                        {"$set": {"processed_at": message.date}},
+                        upsert=True
+                    )
+                    
+                    if result.upserted_id:
+                        logger.info(f"New post detected in {channel_id}: Message ID {msg_id}")
+                        await self._trigger_new_post_actions(client, channel_id, msg_id)
+
+        except FloodWait as e:
+            logger.warning(f"FloodWait in channel monitor for {channel_id}. Sleeping {e.value}s")
+            await asyncio.sleep(e.value)
+        except (ChannelPrivate, PeerIdInvalid):
+            logger.error(f"Cannot access channel {channel_id} with session {session_id}. Check permissions.")
+            # Optionally mark the channel config as inactive
+            await db.monitored_channels.update_one({"channel_id": channel_id}, {"$set": {"is_active": False}})
+        except Exception as e:
+            logger.error(f"Error checking posts in {channel_id}: {e}")
+
+    async def _trigger_new_post_actions(self, client, channel_id: int, message_id: int):
+        """Executes configured actions (e.g., auto-reactions) when a new post is found."""
+        # Placeholder for Reaction and View Management (Part 5/6)
+        # e.g., await reaction_manager.apply_reactions(channel_id, message_id)
+        pass
+
+channel_monitor = ChannelMonitor()
